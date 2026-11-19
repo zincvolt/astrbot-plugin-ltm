@@ -1,0 +1,4 @@
+name: astrbot_plugin_ltm
+desc: 长期记忆：从对话中抽取稳定事实，按语义召回后注入上下文
+author: local
+version: 1.0.0
