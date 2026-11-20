@@ -25,6 +25,7 @@ import math
 import os
 import re
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -55,10 +56,32 @@ def _detect_root() -> Path:
 # 指令自声明：/权限 列表 按插件分组展示用（插件开发规范要求，见 docs/PLUGIN-DEV.md）
 DECLARED_COMMANDS: dict[str, tuple[str, str]] = {
     "/记忆 <内容>": ("记一条长期记忆", "公开"),
+    "/记忆 去重": ("立即跑一次全库记忆去重（大模型判重）", "管理"),
     "/忘记 <关键词>": ("删除匹配的长期记忆", "公开"),
 }
 
 ROOT = _detect_root()
+
+# 权限：优先用 access 统一判定，单拎时自动降级为本地名单（也能用）
+sys.path.insert(0, str(Path(__file__).parent.parent / "astrbot_plugin_access"))
+try:
+    from unified_perm import is_admin as _is_admin
+except ImportError:
+    _STANDALONE_ADMINS = {"1154487120"}
+
+    def _is_admin(event):  # noqa: F811
+        uid = str(event.get_sender_id() or "")
+        return uid in _STANDALONE_ADMINS or getattr(event, "role", "") == "admin"
+
+# ---------- 自动去重（每 24h 用大模型清一遍重复记忆） ----------
+# _store 的写入时去重只看新写入 vs 近 300 条；措辞漂移、跨时间重复、
+# 历史抽取失误要靠这个周期任务清。superseded_by 软删，与现有机制一致。
+DEDUP_INTERVAL = 86400          # 24h
+DEDUP_FIRST_DELAY = 7200        # 启动后先等 2h，避免重启就烧 token
+DEDUP_MAX_FACTS = 400           # 单次最多参与判重的 live 条数（旧的往后排）
+DEDUP_SIM = 0.55                # 文本预筛阈值，低于此不送大模型
+DEDUP_EMB_SIM = 0.90            # 向量预筛阈值
+
 DATA_DIR = Path(os.environ.get("QQNTBOT_DATA", str(ROOT / "data")))
 DB_PATH = DATA_DIR / "memory.db"
 CONFIG_FILE = DATA_DIR / "ltm.json"
@@ -339,6 +362,7 @@ class Main(star.Star):
         self._said: dict[str, list[str]] = {}
         self._init_db()
         self._scan_task: asyncio.Task | None = None
+        self._dedup_task: asyncio.Task | None = None
         self._last_hist_id = self._max_history_id()
         logger.info(
             f"[ltm] memory db ready at {DB_PATH} (history cursor={self._last_hist_id})"
@@ -978,6 +1002,131 @@ class Main(star.Star):
         if self._scan_task is None:
             self._scan_task = asyncio.create_task(self._scan_loop())
             logger.info("[ltm] group history scanner started")
+        if self._dedup_task is None:
+            self._dedup_task = asyncio.create_task(self._dedup_loop())
+            logger.info("[ltm] memory dedup loop started")
+
+    async def _dedup_loop(self) -> None:
+        """Every 24h, let an LLM merge duplicate memories across all users."""
+        await asyncio.sleep(DEDUP_FIRST_DELAY)
+        while True:
+            try:
+                stats = await self._dedup_once()
+                if stats["superseded"]:
+                    logger.info(f"[ltm] auto dedup: {stats}")
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                logger.warning(f"[ltm] auto dedup failed: {exc}")
+            await asyncio.sleep(DEDUP_INTERVAL)
+
+    async def _dedup_once(self, limit: int = DEDUP_MAX_FACTS) -> dict:
+        """Run one LLM-assisted dedup pass over live memories.
+
+        Cheap prefilter (normalised text similarity / embedding cosine)
+        clusters near-duplicate candidates per user, then the LLM decides
+        which rows really describe the same fact; losers get superseded_by
+        pointed at the newest row of their cluster (soft delete, consistent
+        with _store).  Returns ``{"groups", "superseded"}`` counts.
+    """
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT id, uid, text, value, emb, created FROM facts "
+                "WHERE superseded_by IS NULL "
+                "ORDER BY uid ASC, created ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        finally:
+            con.close()
+        if len(rows) < 2:
+            return {"groups": 0, "superseded": 0}
+
+        # ---- 廉价预筛：uid 内相似条目聚成候选组（简单并查集） ----
+        parent = {r[0]: r[0] for r in rows}
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        info: dict[int, tuple[str, list[float]]] = {}
+        for rid, _uid, text, value, emb, _created in rows:
+            vec: list[float] = []
+            if emb:
+                try:
+                    vec = json.loads(emb)
+                except json.JSONDecodeError:
+                    vec = []
+            info[rid] = (self._norm(value or text), vec)
+        items = [r for r in rows if r[0] in info]
+        for i, a in enumerate(items):
+            for b in items[i + 1:]:
+                if a[1] != b[1]:
+                    continue  # 不同 uid 不比
+                na, va = info[a[0]]
+                nb, vb = info[b[0]]
+                same = na == nb or self._similar(na, nb) >= DEDUP_SIM
+                if not same and va and vb:
+                    same = _cosine(va, vb) >= DEDUP_EMB_SIM
+                if same:
+                    ra, rb = find(a[0]), find(b[0])
+                    if ra != rb:
+                        parent[ra] = rb
+
+        clusters: dict[int, list[tuple]] = {}
+        for r in items:
+            clusters.setdefault(find(r[0]), []).append(r)
+        cand = [c for c in clusters.values() if len(c) >= 2]
+        if not cand:
+            return {"groups": 0, "superseded": 0}
+
+        # ---- 大模型判重：逐组问哪些行是同一件事 ----
+        superseded = 0
+        merged_groups = 0
+        con = self._conn()
+        try:
+            for group in cand:
+                lines = "\n".join(
+                    f"{i}. {text}" for i, (_rid, _u, text, _v, _e, _c) in enumerate(group, 1)
+                )
+                prompt = (
+                    "下面是同一个人的几条长期记忆，可能有的在说同一件事（只是措辞不同）。\n"
+                    "找出「说的确实是同一件事」的条目组。不确定的不要算重复。\n"
+                    "只输出 JSON 数组，如 [[2,5],[7,9,11]]，每个子数组是一组重复条目的行号；"
+                    "没有重复输出 []。\n记忆：\n" + lines
+                )
+                try:
+                    raw = await self._chat(prompt, max_tokens=200)
+                    m = re.search(r"\[.*\]", raw, re.S)
+                    data = json.loads(m.group(0)) if m else []
+                except Exception as exc:  # noqa: BLE001 - 一组失败不拖垮整轮
+                    logger.warning(f"[ltm] dedup llm failed: {exc}")
+                    continue
+                if not isinstance(data, list):
+                    continue
+                for idxs in data:
+                    if not isinstance(idxs, list) or len(idxs) < 2:
+                        continue
+                    picked = []
+                    for i in idxs:
+                        if isinstance(i, int) and 1 <= i <= len(group):
+                            picked.append(group[i - 1])
+                    if len(picked) < 2:
+                        continue
+                    keep = max(picked, key=lambda r: r[5])  # created 最新
+                    olds = [r for r in picked if r[0] != keep[0]]
+                    for r in olds:
+                        con.execute(
+                            "UPDATE facts SET superseded_by = ? "
+                            "WHERE id = ? AND superseded_by IS NULL",
+                            (keep[0], r[0]),
+                        )
+                        superseded += 1
+                    merged_groups += 1
+            con.commit()
+        finally:
+            con.close()
+        return {"groups": merged_groups, "superseded": superseded}
 
     async def _scan_loop(self) -> None:
         """Periodically accumulate group messages and extract in batches."""
@@ -1080,8 +1229,21 @@ class Main(star.Star):
     # ---------- commands ----------
 
     @filter.command("记忆")
-    async def show_memory(self, event: AstrMessageEvent) -> None:
-        """List what the bot remembers about the sender."""
+    async def show_memory(self, event: AstrMessageEvent, arg: str = "") -> None:
+        """List what the bot remembers about the sender; ``去重`` runs dedup."""
+        if arg == "去重":
+            if not _is_admin(event):
+                yield event.plain_result("这个指令只有管理员能用喵。")
+                return
+            yield event.plain_result("开始全库记忆去重（大模型判重），跑完汇报……")
+            stats = await self._dedup_once()
+            if stats["superseded"]:
+                yield event.plain_result(
+                    f"去重完成：合并 {stats['groups']} 组，压掉 {stats['superseded']} 条重复记忆。"
+                )
+            else:
+                yield event.plain_result("去重完成：没发现重复的记忆。")
+            return
         uid = event.get_sender_id() or event.get_session_id()
         con = self._conn()
         try:
