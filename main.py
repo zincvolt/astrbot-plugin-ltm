@@ -1,11 +1,19 @@
-"""Long-term memory for QQ chats.
+"""Long-term memory for QQ chats, tuned for a capable LLM on a budget.
 
-Extracts durable facts about each sender after a reply, stores them with
-embeddings, and injects the most relevant memories back into the system
-prompt before the next LLM request.
+Design goals (v4 rewrite, 2026-11-20):
 
-The plugin never touches the LLM deployment itself: it only calls the
-OpenAI-compatible endpoints already running on this machine.
+1. Few LLM calls. The old version scanned every 90s and could fire dozens of
+   DeepSeek calls per hour, most of which came back empty. Now the scanner
+   only accumulates messages; a person is only sent to the model when a real
+   batch has piled up (>= MIN_BATCH usable lines) or a lot of time passed.
+   Group replies never trigger extraction directly.
+2. Slot-keyed storage. Identity-type slots (name/age/location/identity/pet/
+   relation) keep exactly one live row per slot; a new value supersedes the
+   old one. This kills the "养了只傻猫 / 骚猫 / 乐子猫" duplicate swarm that
+   wording drift used to slip past embedding dedupe.
+3. The model sees what is already known, so it stops re-extracting facts.
+4. JSON output. A capable model returns clean JSON; no more verbatim
+   grounding of tiny snippets and no rule-based miner fallback.
 """
 
 from __future__ import annotations
@@ -44,6 +52,12 @@ def _detect_root() -> Path:
     return here.parents[4] if len(here.parents) > 4 else here.parent
 
 
+# 指令自声明：/权限 列表 按插件分组展示用（插件开发规范要求，见 docs/PLUGIN-DEV.md）
+DECLARED_COMMANDS: dict[str, tuple[str, str]] = {
+    "/记忆 <内容>": ("记一条长期记忆", "公开"),
+    "/忘记 <关键词>": ("删除匹配的长期记忆", "公开"),
+}
+
 ROOT = _detect_root()
 DATA_DIR = Path(os.environ.get("QQNTBOT_DATA", str(ROOT / "data")))
 DB_PATH = DATA_DIR / "memory.db"
@@ -61,11 +75,11 @@ CMD_CONFIG = Path(
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "enabled": True,
-    "scan_interval": 300,      # 多久扫一次群历史（秒）
-    "scan_budget": 3,          # 每轮最多为几个人抽取
-    "user_cooldown": 900,      # 同一个人两次扫描抽取的最小间隔（秒）
-    "extract_cooldown": 45,    # 一次对话回复后触发的抽取冷却（秒）
-    "max_tokens": 500,
+    "scan_interval": 300,      # 多久醒一次攒群消息（秒）；醒来本身不调用模型
+    "scan_budget": 3,          # 每轮最多几个人被送模型
+    "user_cooldown": 1800,     # 同一个人两次提取的最小间隔（秒）
+    "extract_cooldown": 900,   # 私聊回复触发的最小间隔（秒）
+    "max_tokens": 300,
     "third_party_scan": True,  # 第三方模式下是否也扫群历史（会产生 API 费用）
 }
 
@@ -80,14 +94,75 @@ RECALL_MIN_SCORE = 0.32
 MAX_INJECTED = 4
 INJECT_MAX_CHARS = 600      # 记忆块总长度上限（约 400 token，64K 上下文的 0.6%）
 INJECT_LINE_CHARS = 60      # 单条记忆截断长度
-EXTRACT_COOLDOWN = 45
 MAX_FACT_CHARS = 120
 MAX_FACTS_PER_USER = 300
-DEDUP_SCORE = 0.92
-MAX_CANDIDATES = 6          # 一次最多改写几个片段，控制小模型负担
+MULTI_SLOT_CAP = 6          # 多值槽位（喜欢/讨厌/习惯/在做的事）每人每槽最多几条
+MAX_CANDIDATES = 8          # 一次提取最多入库几条
+EXTRACT_BATCH = 40          # 一次送给模型的消息上限
+MIN_BATCH = 8               # 积压满这么多条可用消息才值得一次调用
+MAX_WAIT = 1800             # 积压不足时，最多等这么久也照样调用一次（秒）
 
-# 改写结果里出现这些词说明模型在猜，不是原话
-HALLUCINATION_MARKERS = ("可能", "也许", "好像", "估计", "应该", "大概", "似乎")
+DEDUP_TEXT = 0.85           # 多值槽位：文本相似判重阈值
+DEDUP_EMB = 0.88            # 多值槽位：向量判重阈值
+
+# 单值槽位：一个 uid 每个槽只留一条 live 记忆，新值直接顶掉旧值
+SINGLE_SLOTS = {"name", "age", "location", "identity", "pet", "relation"}
+# 多值槽位：可以并存多条，靠相似度去重 + FIFO 上限
+MULTI_SLOTS = {"like", "dislike", "habit", "activity"}
+SLOT_WHITELIST = SINGLE_SLOTS | MULTI_SLOTS
+
+# 这些槽位说的是「最近在干什么」，会过期，注入时必须带时间
+TIMED_SLOTS = {"activity", "habit"}
+
+# 模型把值写成这些词等于没记
+USELESS_VALUES = {
+    "你", "他", "她", "它", "你们", "他们", "她们", "这个", "那个", "这些",
+    "那些", "什么", "怎么", "这样", "那样", "一下", "一点", "真的", "反正",
+    "哈哈", "呵呵", "东西", "事情", "问题", "感觉", "自己", "对方", "人家",
+    "本人", "一个人", "有点", "比较", "非常", "特别", "没", "没有", "不是",
+    "不知道", "算了", "随便", "都行", "一样", "null", "none", "无",
+}
+
+# relation 的值必须能看出是什么关系，否则「那个群有俩人」也会被当成家人
+RELATION_WORDS = (
+    "妈", "爸", "爹", "娘", "哥", "姐", "弟", "妹", "对象", "女友", "男友",
+    "老婆", "老公", "媳妇", "室友", "舍友", "朋友", "同事", "同学", "师父",
+    "徒弟", "儿子", "女儿", "家人", "家里",
+)
+
+SLOT_TEMPLATES = {
+    "name": "对方叫{value}",
+    "age": "对方{value}岁",
+    "location": "对方在{value}",
+    "identity": "对方是{value}",
+    "like": "对方喜欢{value}",
+    "dislike": "对方不喜欢{value}",
+    "habit": "对方经常{value}",
+    "pet": "对方养了{value}",
+    "relation": "对方的{value}",
+    "activity": "对方{value}",
+}
+
+EXTRACT_PROMPT = """你在帮一个 QQ 群聊机器人维护它对某位群友的长期记忆。先给出已经记住的内容，再给出这位群友最近说过的话。
+
+【已记住】
+{known}
+
+【最近说的话】
+{lines}
+
+任务：从这些话里找出「长期成立、值得记住」的新事实，或者对已有记忆的更新。
+
+判断标准：
+- 只记说话人自己的事：身份职业、常住地、宠物、喜欢/讨厌、长期习惯、最近在做的事、人际关系
+- 心情、玩笑、接梗、对别人的评论、一次性的事不记；带「今天/昨天/刚才」的临时状态不记
+- 「在打排位」「在赶稿」这类进行中的事记为 activity，会过期但值得记
+- value 写简短自然的短语（15 字以内），可以浓缩原话，不必逐字抄
+- 【已记住】里仍然正确的内容不要重复输出；只有实质变化才输出新值
+
+输出一个 JSON 数组，每项形如 {"slot": "槽位", "value": "事实", "ref": 原话编号}，例如：
+[{"slot": "location", "value": "南京", "ref": 3}, {"slot": "pet", "value": "一只叫阿灰的猫", "ref": 4}]
+没有值得记的就输出 []。只输出 JSON，不要输出任何解释。"""
 
 PROMPT_FILE = Path(os.environ.get("LTM_PROMPT", str(DATA_DIR / "ltm_prompt.txt")))
 
@@ -98,10 +173,6 @@ _llm_cache: tuple[float, tuple[str, str, str]] | None = None
 
 def _resolve_llm() -> tuple[str, str, str]:
     """Resolve the chat endpoint of the provider AstrBot is currently using.
-
-    Memory extraction used to hard-code the local 8080 server, which silently
-    fails in third-party mode because that server is stopped. Follow whatever
-    ``agent_runner`` points at instead.
 
     Returns:
         Tuple of (api_base, api_key, model).
@@ -149,105 +220,6 @@ def _resolve_llm() -> tuple[str, str, str]:
     _llm_cache = (mtime, resolved)
     logger.info(f"[ltm] extract via provider={pid} model={model}")
     return resolved
-
-# ---------------------------------------------------------------------------
-# 抽取算法：规则挖候选 -> 模型只做改写
-#
-# 先用正则从原话里挖出"明确的第一人称断言"片段，模型不再负责判断"记什么"，
-# 只负责把片段润成一句第三人称陈述。小模型做这么小的事才稳；模型挂了也能用
-# 模板兜底，保证有候选就有记忆。
-# ---------------------------------------------------------------------------
-
-EXTRACT_PROMPT = """把下面每个片段改写成一句关于「对方」的第三人称陈述。
-
-规则：
-- 每行输出一个，格式：编号=陈述
-- 只改写片段里已有的内容，不许添加片段里没有的信息
-- 陈述不超过 20 字，用「对方」开头
-- 片段看不懂、不完整、或只是当下的状态，就输出：编号=NO
-- 不要解释，不要空行
-
-示例：
-1=喜欢猫 -> 1=对方喜欢猫
-2=今天好累 -> 2=NO
-
-待改写片段：
-{candidates}
-"""
-
-# 槽位 -> 优先级；正则第 1 组是核心值
-CANDIDATE_RULES: list[tuple[str, re.Pattern[str]]] = [
-    ("name", re.compile(r"叫我\s*([^\s，。！？、,.!?~～]{1,10})")),
-    ("name", re.compile(r"我(?:的名字)?叫\s*([^\s，。！？、,.!?~～]{1,10})")),
-    ("age", re.compile(r"我(?:今年)?\s*(\d{1,2})\s*(?:岁|周岁)")),
-    (
-        "location",
-        re.compile(
-            r"我(?:现在|目前)?(?:住在|住|在)\s*([\u4e00-\u9fa5A-Za-z]{2,10}?)(?:市|区|县|附近|这边|城里)"
-        ),
-    ),
-    ("location", re.compile(r"我(?:是|来自)\s*([\u4e00-\u9fa5]{2,8})(?:人|本地)")),
-    # 「我是」后面太杂，正则只负责抓，身份词由 _is_identity 校验
-    ("identity", re.compile(r"我是(?:一个|一名|个)?\s*([\u4e00-\u9fa5A-Za-z]{2,12})")),
-    ("like", re.compile(r"我(?:最|很|超|特别|蛮|挺)?(?:喜欢|爱|迷上|厨)\s*([^\s，。！？、,.!?~～]{1,16})")),
-    ("dislike", re.compile(r"我(?:不喜欢|讨厌|受不了|怕|不玩|不吃)\s*([^\s，。！？、,.!?~～]{1,16})")),
-    ("habit", re.compile(r"我(?:每天|每晚|经常|一般|通常|习惯|老是|总是)\s*([^\s，。！？、,.!?~～]{2,18})")),
-    (
-        "pet",
-        re.compile(
-            r"我(?:养|有)了?\s*(?:一只|一个|一条|两只|三只)?\s*"
-            r"([\u4e00-\u9fa5]{1,8}?(?:猫|狗|兔|鸟|仓鼠|蛇|蜥蜴|龙猫|鱼|鹦鹉))"
-        ),
-    ),
-    (
-        "relation",
-        re.compile(
-            r"我(?:对象|女朋友|男朋友|老婆|老公|室友|哥哥|姐姐|弟弟|妹妹)(?:是|在|叫)\s*"
-            r"([^\s，。！？、,.!?~～]{1,14})"
-        ),
-    ),
-    # 「我在做某事」，要求带「在」且后面不是形容词性状态
-    ("activity", re.compile(r"我(?:最近|这阵子)?在\s*([^\s，。！？、,.!?~～]{2,16})")),
-]
-
-# 身份词：只有以这些词结尾的「我是X」才算长期身份
-IDENTITY_SUFFIXES = (
-    "学生", "大学生", "高中生", "研究生", "程序员", "工程师", "画师", "设计师",
-    "老师", "医生", "护士", "律师", "会计", "兽人", "社畜", "玩家", "写手",
-    "乐手", "作者", "主播", "店主", "公务员", "研究生",
-)
-# 值以这些结尾说明在指代眼前的东西，记下来没意义
-VAGUE_SUFFIXES = ("这个", "那个", "这些", "那些", "这种", "那种", "这里", "那里")
-# 值开头这些虚词是噪音：「我每天都喝咖啡」不该记成「经常都喝咖啡」
-VALUE_PREFIX_NOISE = ("都", "就", "也", "还", "又")
-
-# 这些词说明说的是"眼下这一刻"，不是长期事实
-TEMPORAL_FLAGS = (
-    "今天", "今晚", "刚才", "刚刚", "现在", "这会儿", "马上", "明天",
-    "昨天", "昨晚", "等下", "待会", "这两天",
-)
-# 命中这些槽位时，带时间副词就更可能是临时状态，直接丢
-VOLATILE_SLOTS = {"like", "dislike", "habit"}
-
-# 值本身不能是这些东西
-USELESS_VALUES = {
-    "你", "他", "她", "它", "你们", "他们", "她们", "这个", "那个", "这些",
-    "那些", "什么", "怎么", "这样", "那样", "一下", "一点", "真的", "反正",
-    "哈哈", "呵呵", "东西", "事情", "问题", "感觉",
-}
-
-SLOT_TEMPLATES = {
-    "name": "对方叫{value}",
-    "age": "对方{value}岁",
-    "location": "对方在{value}",
-    "identity": "对方是{value}",
-    "like": "对方喜欢{value}",
-    "dislike": "对方不喜欢{value}",
-    "habit": "对方经常{value}",
-    "pet": "对方养了{value}",
-    "relation": "对方的{value}",
-    "activity": "对方在{value}",
-}
 
 
 def _looks_mojibake(text: str) -> bool:
@@ -309,32 +281,37 @@ def load_settings() -> dict[str, Any]:
 
 
 def load_prompt() -> str:
-    """Return the rewrite prompt, preferring the editable file.
+    """Return the extraction prompt, preferring the editable file.
 
-    Recovers from the common "UTF-8 saved as Latin-1" mojibake that silently
-    turns the whole prompt into gibberish for the model.
+    The v4 prompt needs both ``{lines}`` (the messages) and ``{known}`` (the
+    slot summary). Older files with only ``{lines}`` are still accepted; the
+    missing ``{known}`` degrades to "no known facts shown".
 
     Returns:
-        Prompt template containing the ``{candidates}`` placeholder.
+        Prompt template.
     """
     try:
         text = PROMPT_FILE.read_text(encoding="utf-8")
     except OSError:
         return EXTRACT_PROMPT
 
+    def ok(tpl: str) -> bool:
+        return "{lines}" in tpl
+
     if _looks_mojibake(text):
         fixed = _demojibake(text)
-        if fixed and "{candidates}" in fixed:
+        if fixed and ok(fixed):
             logger.warning("[ltm] ltm_prompt.txt 是乱码，已自动还原（建议检查文件编码）")
             text = fixed
         else:
             logger.warning("[ltm] ltm_prompt.txt 是乱码且无法还原，回落到内置提示词")
             return EXTRACT_PROMPT
 
-    if "{candidates}" in text:
+    if ok(text):
         return text
-    logger.warning("[ltm] ltm_prompt.txt 缺少 {candidates} 占位符，回落到内置提示词")
+    logger.warning("[ltm] ltm_prompt.txt 缺少 {lines} 占位符，回落到内置提示词")
     return EXTRACT_PROMPT
+
 
 def _cosine(a: list[float], b: list[float]) -> float:
     """Return cosine similarity of two equal-length vectors."""
@@ -358,6 +335,8 @@ class Main(star.Star):
         self._last_scan_user: dict[str, float] = {}
         # 未被本轮预算处理到的消息留在这里，避免历史游标越过后永久丢失
         self._pending: dict[str, list[str]] = {}
+        # 私聊里每个人最近说过的话，让一次单条回复也能带上上下文去抽取
+        self._said: dict[str, list[str]] = {}
         self._init_db()
         self._scan_task: asyncio.Task | None = None
         self._last_hist_id = self._max_history_id()
@@ -448,12 +427,12 @@ class Main(star.Star):
     async def _chat(self, prompt: str, max_tokens: int | None = None) -> str:
         """Run one short completion against the active provider.
 
-        Thinking models (DeepSeek V4 and friends) spend the whole token budget
-        on reasoning and return an empty ``content`` when ``max_tokens`` is
-        small, so reasoning is explicitly disabled.
+        Reasoning models spend the whole token budget on reasoning and return
+        an empty ``content`` when ``max_tokens`` is small, so reasoning is
+        explicitly disabled.
         """
         base, key, model = _resolve_llm()
-        limit = max_tokens or int(load_settings().get("max_tokens") or 500)
+        limit = max_tokens or int(load_settings().get("max_tokens") or 300)
         payload: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -480,28 +459,60 @@ class Main(star.Star):
 
     # ---------- recall ----------
 
-    def _recent(self, uid: str, limit: int) -> list[str]:
-        """Return the most recently stored live facts for a user."""
+    def _recent_rows(self, uid: str, limit: int) -> list[tuple[str, str | None, float]]:
+        """Return the newest live facts as ``(text, slot, created)``."""
         con = self._conn()
         try:
-            rows = con.execute(
-                "SELECT text FROM facts WHERE uid = ? AND superseded_by IS NULL "
+            return con.execute(
+                "SELECT text, slot, created FROM facts "
+                "WHERE uid = ? AND superseded_by IS NULL "
                 "ORDER BY created DESC LIMIT ?",
                 (uid, limit),
             ).fetchall()
-            return [r[0] for r in rows]
         finally:
             con.close()
 
+    @staticmethod
+    def _age_tag(created: float, now: float) -> str:
+        """Describe how old a memory is, in the unit people actually use."""
+        days = max(0.0, (now - created) / 86400)
+        if days < 1:
+            return "今天"
+        if days < 2:
+            return "昨天"
+        if days < 7:
+            return f"{int(days)}天前"
+        if days < 40:
+            return f"{int(days // 7)}周前"
+        return f"{int(days // 30)}个月前"
+
+    def _timed(self, text: str, slot: str | None, created: float, now: float) -> str:
+        """Stamp the memories whose meaning depends on when they were said."""
+        if slot in TIMED_SLOTS:
+            return f"{text}（{self._age_tag(created, now)}）"
+        return text
+
+    def _recent(self, uid: str, limit: int) -> list[str]:
+        """Return the most recently stored live facts, time-stamped."""
+        now = time.time()
+        return [self._timed(t, s, c, now) for t, s, c in self._recent_rows(uid, limit)]
+
     async def _recall(self, uid: str, query: str) -> list[str]:
-        """Pick memories relevant to the current message."""
+        """Pick memories relevant to the current message, no duplicates."""
+        now = time.time()
+        if not (query or "").strip():
+            return [
+                self._timed(t, s, c, now)
+                for t, s, c in self._recent_rows(uid, MAX_INJECTED)
+            ]
+
         con = self._conn()
         try:
             rows = con.execute(
-                "SELECT id, text, emb, created FROM facts "
+                "SELECT text, emb, created, slot FROM facts "
                 "WHERE uid = ? AND superseded_by IS NULL AND created >= ? "
                 "ORDER BY created DESC LIMIT 400",
-                (uid, time.time() - 30 * 86400),
+                (uid, now - 30 * 86400),
             ).fetchall()
         finally:
             con.close()
@@ -509,29 +520,47 @@ class Main(star.Star):
         if not rows:
             return []
 
+        def already(label: str, picked: list[str]) -> bool:
+            """Same text, or nearly same text, is already in the block."""
+            norm = self._norm(label)
+            return any(self._similar(norm, self._norm(p)) >= 0.85 for p in picked)
+
         vectors = await self._embed([query])
         if not vectors:
-            # No embedding service: fall back to the most recent memories.
-            return [r[1] for r in rows[:MAX_INJECTED]]
+            picked: list[str] = []
+            for text, _emb, created, slot in rows[:MAX_INJECTED]:
+                label = self._timed(text, slot, created, now)
+                if not already(label, picked):
+                    picked.append(label)
+            return picked
 
         qv = vectors[0]
-        scored: list[tuple[float, str]] = []
-        for fact_id, text, emb, _created in rows:
+        scored: list[tuple[float, str, str | None, float]] = []
+        for text, emb, created, slot in rows:
             try:
                 fv = json.loads(emb) if emb else None
             except json.JSONDecodeError:
                 fv = None
             score = _cosine(qv, fv) if fv else 0.0
             if score >= RECALL_MIN_SCORE:
-                scored.append((score, text))
+                scored.append((score, text, slot, created))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        picked = [t for _, t in scored[:RECALL_TOP_K]]
+        picked = []
+        for _score, text, slot, created in scored:
+            label = self._timed(text, slot, created, now)
+            if already(label, picked):
+                continue
+            picked.append(label)
+            if len(picked) >= RECALL_TOP_K:
+                break
 
         # Always keep a few recent memories so the bot does not forget context.
-        for text in self._recent(uid, 4):
-            if text not in picked:
-                picked.append(text)
+        for text, slot, created in self._recent_rows(uid, 4):
+            label = self._timed(text, slot, created, now)
+            if already(label, picked):
+                continue
+            picked.append(label)
 
         return picked[:MAX_INJECTED]
 
@@ -549,153 +578,166 @@ class Main(star.Star):
             return 0.0
         return difflib.SequenceMatcher(None, a, b).ratio()
 
-    def _mine(self, text: str) -> list[tuple[str, str]]:
-        """Mine high-confidence ``(slot, value)`` pairs from one message.
-
-        Only explicit first-person statements are taken. Anything that looks
-        like a question, a one-off state or a pronoun is dropped: a missing
-        memory is cheaper than a wrong one.
+    def _known_facts(self, uid: str) -> str:
+        """Render the slot summary the model sees, so it stops re-extracting.
 
         Args:
-            text: One raw message from the user.
+            uid: Sender id.
 
         Returns:
-            Slot/value pairs in rule-priority order.
+            One ``slot: value、value`` per line, or a placeholder line.
         """
-        cleaned = (text or "").strip()
-        if len(cleaned) < 4:
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT slot, value, created FROM facts "
+                "WHERE uid = ? AND superseded_by IS NULL AND value IS NOT NULL "
+                "ORDER BY created DESC LIMIT 80",
+                (uid,),
+            ).fetchall()
+        finally:
+            con.close()
+        if not rows:
+            return "（还没有任何记忆）"
+        per_slot: dict[str, list[str]] = {}
+        for slot, value, _created in rows:
+            bucket = per_slot.setdefault(slot or "misc", [])
+            if value not in bucket and len(bucket) < 4:
+                bucket.append(value)
+        lines = []
+        for slot in sorted(per_slot):
+            lines.append(f"{slot}: {'、'.join(per_slot[slot])}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _worth_sending(text: str) -> bool:
+        """Return True when a message may carry a first-person fact.
+
+        This is only a coarse filter that saves prompt tokens: instructions,
+        pure emoji and pure questions never reach the model.
+
+        Args:
+            text: One raw message.
+
+        Returns:
+            Whether the message is worth model tokens.
+        """
+        t = (text or "").strip()
+        if len(t) < 2:
+            return False
+        if t[0] in "/#!！":
+            return False
+        # 纯表情、纯符号
+        if not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", t):
+            return False
+        if re.fullmatch(r"\[[^\]]{1,10}\]", t):
+            return False
+        # 问句问的是别人，不是自己的事实
+        if t.rstrip("。.!！~～ 　").endswith(("吗", "呢", "嘛", "?", "？")):
+            return False
+        return True
+
+    def _parse_facts(self, raw: str, n_lines: int) -> list[tuple[str, str]]:
+        """Parse the model's JSON array into validated ``(slot, value)`` pairs.
+
+        Tolerates `````json`` fences and stray prose around the array.
+
+        Args:
+            raw: Raw model output.
+            n_lines: How many messages were sent (used to sanity-check ``ref``).
+
+        Returns:
+            Accepted pairs, in model order.
+        """
+        m = re.search(r"\[.*\]", raw or "", re.S)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            logger.info("[ltm] model output is not valid JSON, dropped")
+            return []
+        if not isinstance(data, list):
             return []
 
-        has_volatile = any(word in cleaned for word in TEMPORAL_FLAGS)
-        found: list[tuple[str, str]] = []
-        per_slot: dict[str, list[str]] = {}
-
-        for slot, pattern in CANDIDATE_RULES:
-            if slot in VOLATILE_SLOTS and has_volatile:
+        out: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in data:
+            if not isinstance(item, dict):
                 continue
-            for m in pattern.finditer(cleaned):
-                # 「我喜欢猫吗」这类是问句，不是陈述
-                if re.match(r"^\s*(吗|呢|嘛|么|？|\?)", cleaned[m.end():]):
-                    continue
-                value = m.group(1).strip(" 　的了吧啊呀哦啦")
-                for prefix in VALUE_PREFIX_NOISE:
-                    if value.startswith(prefix) and len(value) > 2:
-                        value = value[1:]
-                        break
-                value = value.strip(" 　的了吧啊呀哦啦")
-                if not value or value in USELESS_VALUES:
-                    continue
-                if value.endswith(VAGUE_SUFFIXES):
-                    continue
-                if re.search(r"[吗呢嘛]$", value):
-                    continue
-                if slot == "identity" and not value.endswith(IDENTITY_SUFFIXES):
-                    continue
-                # 单字只对「喜欢/讨厌/养」这类成立，猫、狗、鱼都是好事实
-                lo = 1 if slot in ("name", "age", "like", "dislike", "pet") else 2
-                hi = 10 if slot in ("name", "age") else 16
-                if not lo <= len(value) <= hi:
-                    continue
-                bucket = per_slot.setdefault(slot, [])
-                if value in bucket:
-                    continue
-                bucket.append(value)
-                found.append((slot, value))
-                if len(bucket) >= 2:
-                    break
-
-        return found[:MAX_CANDIDATES]
-
-    async def _rewrite(self, cands: list[tuple[str, str]]) -> dict[int, str]:
-        """Ask the model to turn mined snippets into third-person statements.
-
-        The model only sees a numbered snippet list, so the task stays small
-        enough for the local 9B model. Any failure returns an empty mapping and
-        the caller falls back to templates.
-
-        Args:
-            cands: Mined slot/value pairs.
-
-        Returns:
-            Mapping of 1-based snippet index to rewritten sentence.
-        """
-        listing = "\n".join(
-            f"{i}={value}" for i, (_slot, value) in enumerate(cands, 1)
-        )
-        try:
-            raw = await self._chat(load_prompt().replace("{candidates}", listing))
-        except Exception as exc:  # noqa: BLE001 - templates keep extraction alive
-            logger.warning(f"[ltm] rewrite call failed, 用模板兜底: {exc}")
-            return {}
-
-        out: dict[int, str] = {}
-        for line in raw.splitlines():
-            m = re.match(r"^\s*(\d+)\s*[=:：]\s*(.+?)\s*$", line)
-            if not m:
+            slot = str(item.get("slot", "")).strip().lower()
+            value = str(item.get("value", "")).strip().strip("`\"'“”‘’。，、；,.!！?？~～ 　")
+            if slot not in SLOT_WHITELIST:
                 continue
-            body = m.group(2).strip().strip("`\"'“”‘’")
-            if body.upper() in ("NO", "N/A", "无", "跳过", "无。"):
+            if not 1 <= len(value) <= 24:
                 continue
-            out[int(m.group(1))] = body
+            if value.lower() in USELESS_VALUES:
+                continue
+            if slot == "relation" and not any(w in value for w in RELATION_WORDS):
+                continue
+            ref = item.get("ref")
+            if isinstance(ref, int) and not 1 <= ref <= max(1, n_lines):
+                # 编号越界说明模型在编，这条不要
+                logger.info(f"[ltm] drop out-of-range ref {ref} for {slot}={value!r}")
+                continue
+            key = (slot, self._norm(value))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((slot, value))
+            if len(out) >= MAX_CANDIDATES:
+                break
         return out
 
-    def _keeps_core(self, text: str, value: str) -> bool:
-        """Return True when a rewritten sentence still carries the mined value.
+    @staticmethod
+    def _render(slot: str, value: str) -> str:
+        """Turn a ``(slot, value)`` into one natural Chinese sentence."""
+        v = (value or "").strip()
+        if slot == "pet" and not re.search(r"[只条个匹头]", v):
+            v = f"只{v}" if len(v) <= 6 else v
+        return SLOT_TEMPLATES.get(slot, "{value}").format(value=v)
 
-        A literal substring test is too strict for a 9B model ("都要喝咖啡" ->
-        "爱喝咖啡" is a fair paraphrase), so this compares character sets and
-        only rejects rewrites that dropped most of the value.
-
-        Args:
-            text: Candidate rewritten sentence.
-            value: Original snippet that must survive the rewrite.
-
-        Returns:
-            Whether enough of the snippet is present.
-        """
-        core = set(self._norm(value))
-        if not core:
-            return True
-        return len(core & set(self._norm(text))) / len(core) >= 0.5
-
-    async def _extract(
-        self, uid: str, lines: list[str], source: str = "chat"
-    ) -> None:
-        """Mine, rewrite and persist facts for one user.
+    async def _extract(self, uid: str, lines: list[str], source: str = "scan") -> None:
+        """Send one batch to the model and persist what it finds.
 
         Args:
             uid: Sender id the facts belong to.
-            lines: The user's own messages (one turn, or a batch from a group).
-            source: ``chat`` for a direct turn, ``scan`` for group-history scan.
+            lines: The user's own messages (a batch, oldest first).
+            source: ``chat`` for a private-chat turn, ``scan`` for group history.
         """
-        cands: list[tuple[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for line in lines:
-            for slot, value in self._mine(line):
-                key = (slot, self._norm(value))
-                if key in seen:
-                    continue
-                seen.add(key)
-                cands.append((slot, value))
-                if len(cands) >= MAX_CANDIDATES:
-                    break
-            if len(cands) >= MAX_CANDIDATES:
-                break
-        if not cands:
+        usable = [t for t in lines if self._worth_sending(t)]
+        if not usable:
+            return
+        usable = usable[-EXTRACT_BATCH:]
+
+        listing = "\n".join(f"{i}|{t}" for i, t in enumerate(usable, 1))
+        prompt = load_prompt()
+        if "{known}" in prompt:
+            prompt = prompt.replace("{known}", self._known_facts(uid), 1)
+        prompt = prompt.replace("{lines}", listing, 1)
+
+        try:
+            raw = await self._chat(prompt)
+        except Exception as exc:  # noqa: BLE001 - skip this round, retry later
+            logger.warning(f"[ltm] extract call failed ({source}): {exc}")
+            return
+        if not (raw or "").strip():
+            logger.info(f"[ltm] empty model reply for {uid} ({source})")
             return
 
-        rewritten = await self._rewrite(cands)
+        tags = self._parse_facts(raw, len(usable))
+        if not tags:
+            logger.info(
+                f"[ltm] nothing new for {uid} ({source}, {len(usable)} msgs, "
+                f"{len(raw)} chars reply)"
+            )
+            return
 
         produced: list[tuple[str, str, str]] = []
-        for idx, (slot, value) in enumerate(cands, 1):
-            text = rewritten.get(idx, "")
-            # 模型改写不能把核心值丢掉，否则视为幻觉，退回模板
-            if not text or not self._keeps_core(text, value):
-                text = SLOT_TEMPLATES.get(slot, "").format(value=value)
+        for slot, value in tags:
+            text = self._render(slot, value)
             text = re.sub(r"\s+", "", text).strip("。，、；;,.!")
             if not 4 <= len(text) <= MAX_FACT_CHARS:
-                continue
-            if any(word in text for word in HALLUCINATION_MARKERS):
                 continue
             produced.append((slot, value, text))
         if not produced:
@@ -706,20 +748,21 @@ class Main(star.Star):
     async def _store(
         self, uid: str, produced: list[tuple[str, str, str]], source: str
     ) -> None:
-        """Persist new facts, skipping duplicates and retiring weaker wording.
+        """Persist facts with slot-keyed dedupe.
 
-        Duplicate rules, in order: identical text, identical value, one value
-        containing the other (same slot), embedding similarity. When a shorter
-        wording is replaced by a fuller one the old row is marked
-        ``superseded_by`` instead of being deleted.
+        Single-value slots keep one live row per slot: a new value supersedes
+        the old one outright, which makes wording drift unable to pile up
+        duplicates. Multi-value slots dedupe by normalised value, text
+        similarity and embedding similarity, then cap per-slot rows FIFO.
         """
-        vectors = await self._embed([text for _s, _v, text in produced]) or []
+        texts = [text for _s, _v, text in produced]
+        vectors = await self._embed(texts) or []
 
         con = self._conn()
         added = 0
         try:
             existing = con.execute(
-                "SELECT id, text, emb, slot, value FROM facts "
+                "SELECT id, text, emb, slot, value, created FROM facts "
                 "WHERE uid = ? AND superseded_by IS NULL "
                 "ORDER BY created DESC LIMIT 300",
                 (uid,),
@@ -734,26 +777,34 @@ class Main(star.Star):
                 dup = False
                 stale: list[int] = []
 
-                for fid, old_text, old_emb, old_slot, old_value in live:
-                    if norm_text == self._norm(old_text):
-                        dup = True
-                        break
-                    ov = self._norm(old_value or "")
-                    if ov and nv:
-                        if ov == nv:
-                            dup = True
-                            break
-                        if old_slot == slot and (ov in nv or nv in ov):
-                            stale.append(fid)
+                if slot in SINGLE_SLOTS:
+                    for fid, old_text, _e, old_slot, old_value, _c in live:
+                        if old_slot != slot:
                             continue
-                    if vec and old_emb:
-                        try:
-                            ovec = json.loads(old_emb)
-                        except json.JSONDecodeError:
-                            ovec = None
-                        if ovec and _cosine(vec, ovec) >= DEDUP_SCORE:
+                        ov = self._norm(old_value or old_text)
+                        if ov == nv or self._similar(ov, nv) >= 0.85:
                             dup = True
                             break
+                        stale.append(fid)  # 同槽位旧值一律被新值顶掉
+                else:
+                    for fid, old_text, old_emb, old_slot, old_value, _c in live:
+                        if old_slot != slot:
+                            continue
+                        ov = self._norm(old_value or "")
+                        if ov and nv and (ov == nv or self._similar(ov, nv) >= DEDUP_TEXT):
+                            dup = True
+                            break
+                        if self._similar(norm_text, self._norm(old_text)) >= DEDUP_TEXT:
+                            dup = True
+                            break
+                        if vec and old_emb:
+                            try:
+                                ovec = json.loads(old_emb)
+                            except json.JSONDecodeError:
+                                ovec = None
+                            if ovec and _cosine(vec, ovec) >= DEDUP_EMB:
+                                dup = True
+                                break
 
                 if dup:
                     continue
@@ -779,8 +830,21 @@ class Main(star.Star):
                         "WHERE id = ? AND superseded_by IS NULL",
                         (new_id, fid),
                     )
-                live.append((new_id, text, json.dumps(vec) if vec else None, slot, value))
+                live.append(
+                    (new_id, text, json.dumps(vec) if vec else None, slot, value, now)
+                )
                 added += 1
+
+            # 多值槽位超上限：把最旧的压掉
+            counts: dict[str, list[int]] = {}
+            for fid, _t, _e, old_slot, _v, _c in live:
+                if old_slot in MULTI_SLOTS:
+                    counts.setdefault(old_slot, []).append(fid)
+            for slot_ids in counts.values():
+                for fid in slot_ids[:-MULTI_SLOT_CAP] if len(slot_ids) > MULTI_SLOT_CAP else []:
+                    con.execute(
+                        "UPDATE facts SET superseded_by = -1 WHERE id = ?", (fid,)
+                    )
 
             con.execute(
                 """DELETE FROM facts WHERE uid = ? AND id NOT IN (
@@ -799,22 +863,27 @@ class Main(star.Star):
     async def inject_memory(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
-        """Append relevant memories to the system prompt."""
+        """Append relevant memories to the system prompt.
+
+        The block is capped twice on purpose: one line per memory (60 chars)
+        and 600 chars overall, roughly 0.6% of a 64K window.
+        """
         uid = event.get_sender_id() or event.get_session_id()
         if not uid:
             return
         query = (event.message_str or "").strip()
-        memories = await self._recall(uid, query) if query else self._recent(uid, 6)
+        memories = await self._recall(uid, query)
         if not memories:
             return
-        # 每条截断 + 总量封顶，避免记忆挤占对话上下文
         lines = []
         budget = INJECT_MAX_CHARS
         for mem in memories:
             line = mem if len(mem) <= INJECT_LINE_CHARS else mem[:INJECT_LINE_CHARS] + "…"
             if budget - len(line) < 0:
                 break
-            lines.append("- " + line)
+            if any(line in existing or existing in line for existing in lines):
+                continue
+            lines.append(line)
             budget -= len(line) + 2
         if not lines:
             return
@@ -823,23 +892,44 @@ class Main(star.Star):
             "\n\n[你长期记得的关于对方的事，自然地用，不要逐条复述]\n" + block
         )
 
+    def _append_said(self, uid: str, texts: list[str]) -> list[str]:
+        """Record what one person just said and return the rolling window."""
+        buf = self._said.setdefault(uid, [])
+        buf.extend(t for t in texts if t and t.strip())
+        if len(buf) > 24:
+            del buf[:-24]
+        return buf
+
     @filter.on_llm_response()
     async def learn_from_turn(
         self, event: AstrMessageEvent, response: LLMResponse
     ) -> None:
-        """Schedule fact extraction after a reply."""
+        """Schedule fact extraction for private chats only.
+
+        Group messages are all captured by the background scanner (they are in
+        ``platform_message_history``), so replying in a group never triggers
+        an extra model call here. Private chats have no scanner, so a reply is
+        the only chance to learn — throttled by ``extract_cooldown``.
+        """
         uid = event.get_sender_id() or event.get_session_id()
+        if not uid:
+            return
+        # 群聊一律交给扫描器攒批处理，回复不触发
+        if event.get_group_id():
+            return
         user_text = (event.message_str or "").strip()
-        if not uid or len(user_text) < 6:
+        if len(user_text) < 4:
             return
 
+        said = self._append_said(uid, [user_text])
+
         now = time.time()
-        cooldown = float(load_settings().get("extract_cooldown") or EXTRACT_COOLDOWN)
+        cooldown = float(load_settings().get("extract_cooldown") or 900)
         if now - self._last_extract.get(uid, 0.0) < cooldown:
             return
         self._last_extract[uid] = now
 
-        asyncio.create_task(self._extract(uid, [user_text], "chat"))
+        asyncio.create_task(self._extract(uid, list(said), "chat"))
 
     # ---------- group-history scanning ----------
 
@@ -890,10 +980,10 @@ class Main(star.Star):
             logger.info("[ltm] group history scanner started")
 
     async def _scan_loop(self) -> None:
-        """Periodically learn facts about everyone who talks in the group."""
+        """Periodically accumulate group messages and extract in batches."""
         while True:
             conf = load_settings()
-            interval = max(30, int(conf.get("scan_interval") or 300))
+            interval = max(60, int(conf.get("scan_interval") or 300))
             await asyncio.sleep(interval)
             if not conf.get("enabled", True):
                 continue
@@ -903,14 +993,7 @@ class Main(star.Star):
                 logger.warning(f"[ltm] scan failed: {exc}")
 
     def _is_third_party(self) -> bool:
-        """Return True when the bot runs on the third-party API.
-
-        Local big models must not be used in that mode, so memory extraction is
-        skipped entirely.
-
-        Returns:
-            Whether the bot is currently on the third-party API.
-        """
+        """Return True when the bot runs on the third-party API."""
         try:
             cfg = json.loads(CMD_CONFIG.read_text(encoding="utf-8-sig"))
             pid = str(
@@ -932,7 +1015,13 @@ class Main(star.Star):
             return False
 
     async def _scan_once(self) -> None:
-        """Queue new group messages per sender and extract for a few of them."""
+        """Queue new group messages per sender and extract full batches only.
+
+        Waking up is cheap (no model call). A person goes to the model only
+        when ``MIN_BATCH`` usable messages piled up, or when pending messages
+        have waited longer than ``MAX_WAIT`` — one call then digests
+        everything that person said since the last extraction.
+        """
         conf = load_settings()
         if self._is_third_party() and not conf.get("third_party_scan", True):
             logger.info("[ltm] third-party mode: memory scan disabled by config")
@@ -944,44 +1033,48 @@ class Main(star.Star):
             for _rid, uid, text in rows:
                 buf = self._pending.setdefault(uid, [])
                 buf.append(text)
-                # 每人只留最近 40 条，控制内存
-                if len(buf) > 40:
-                    del buf[:-40]
+                # 每人只留最近 60 条，控制内存
+                if len(buf) > 60:
+                    del buf[:-60]
 
         if not self._pending:
             return
 
         budget = max(1, int(conf.get("scan_budget") or 3))
-        cooldown = float(conf.get("user_cooldown") or 900)
+        cooldown = float(conf.get("user_cooldown") or 1800)
         now = time.time()
-        # 先用规则过一遍：挖不出候选的人不值得花一次模型调用
-        scored: list[tuple[int, str, list[str]]] = []
+        picked: list[tuple[int, str, list[str]]] = []
         for uid, texts in self._pending.items():
-            if not texts:
+            usable = [t for t in texts if self._worth_sending(t)]
+            if not usable:
+                self._pending[uid] = []
                 continue
             if now - self._last_scan_user.get(uid, 0.0) < cooldown:
                 continue  # 冷却中，保留 pending 等下一轮
-            hits = sum(len(self._mine(t)) for t in texts)
-            if hits:
-                scored.append((hits, uid, texts))
-        # 候选多的人优先，信息量通常更大
-        scored.sort(key=lambda item: -item[0])
+            last = self._last_scan_user.get(uid, 0.0)
+            waited = now - last
+            if len(usable) >= MIN_BATCH or waited >= MAX_WAIT:
+                picked.append((len(usable), uid, usable))
+
+        picked.sort(key=lambda item: -item[0])
 
         handled = 0
-        for _hits, uid, texts in scored:
+        for _score, uid, usable in picked:
             if budget <= 0:
                 break
             budget -= 1
             handled += 1
             self._last_scan_user[uid] = now
-            self._pending[uid] = []
-            await self._extract(uid, texts, "scan")
+            batch = usable[:EXTRACT_BATCH]
+            self._pending[uid] = usable[EXTRACT_BATCH:]
+            await self._extract(uid, batch, "scan")
 
         for uid in [k for k, v in self._pending.items() if not v]:
             self._pending.pop(uid, None)
+        backlog = sum(len(v) for v in self._pending.values())
         logger.info(
             f"[ltm] scanned {len(rows)} msgs, {handled} sender(s) extracted, "
-            f"{len(self._pending)} pending"
+            f"{backlog} msg(s) queued"
         )
 
     # ---------- commands ----------
@@ -993,14 +1086,21 @@ class Main(star.Star):
         con = self._conn()
         try:
             rows = con.execute(
-                "SELECT text FROM facts WHERE uid = ? ORDER BY created DESC LIMIT 20", (uid,)
+                "SELECT text, slot, created, superseded_by FROM facts "
+                "WHERE uid = ? ORDER BY created DESC LIMIT 20",
+                (uid,),
             ).fetchall()
         finally:
             con.close()
         if not rows:
             yield event.plain_result("我还没记住关于你的事。")
             return
-        body = "\n".join(f"{i}. {r[0]}" for i, r in enumerate(rows, 1))
+        now = time.time()
+        body = "\n".join(
+            f"{i}. {self._timed(text, slot, created, now)}"
+            + ("（已过期）" if superseded else "")
+            for i, (text, slot, created, superseded) in enumerate(rows, 1)
+        )
         yield event.plain_result(f"关于 {uid} 的记忆（共 {len(rows)} 条）：\n{body}")
 
     @filter.command("忘记")

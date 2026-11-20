@@ -1,4 +1,4 @@
 name: astrbot_plugin_ltm
-desc: 长期记忆：从对话中抽取稳定事实，按语义召回后注入上下文
+desc: 长期记忆：从对话中抽取稳定事实，按语义召回后注入上下文。整套 QQ 机器人方案主仓库：github.com/zincvolt/QQNTbotBUTafter261101
 author: local
 version: 1.1.0
