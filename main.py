@@ -63,6 +63,63 @@ DECLARED_COMMANDS: dict[str, tuple[str, str]] = {
 
 ROOT = _detect_root()
 
+# ---------- 直连 token 账本（与 dashboard 共享 ltm_usage.json）----------
+# 第三方模式下抽取/去重走 httpx 直连、不经 provider，apimode 统计不到，
+# 这里自己记账并接受每日额度闸（dashboard 可调，超额时抽取优雅跳过）。
+USAGE_FILE = ROOT / "data" / "ltm_usage.json"
+_USAGE_CACHE: dict = {"mtime": 0.0, "data": {}}
+
+
+def _today_key() -> str:
+    return time.strftime("%Y%m%d")
+
+
+def _load_usage() -> dict:
+    global _USAGE_CACHE
+    try:
+        stat = USAGE_FILE.stat()
+    except OSError:
+        return {"date": _today_key(), "tokens": 0, "daily_limit": 100000, "enabled": True}
+    if _USAGE_CACHE["data"] and stat.st_mtime == _USAGE_CACHE["mtime"]:
+        data = dict(_USAGE_CACHE["data"])
+    else:
+        try:
+            data = json.loads(USAGE_FILE.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        _USAGE_CACHE = {"mtime": stat.st_mtime, "data": dict(data)}
+    data.setdefault("daily_limit", 100000)
+    data.setdefault("enabled", True)
+    if data.get("date") != _today_key():
+        data["date"] = _today_key()
+        data["tokens"] = 0
+    return data
+
+
+def _quota_ok() -> bool:
+    d = _load_usage()
+    if not d.get("enabled", True):
+        return False
+    limit = int(d.get("daily_limit") or 0)
+    if limit and int(d.get("tokens") or 0) >= limit:
+        return False
+    return True
+
+
+def _add_usage(tokens: int) -> None:
+    if tokens <= 0:
+        return
+    d = _load_usage()
+    d["date"] = _today_key()
+    d["tokens"] = int(d.get("tokens") or 0) + int(tokens)
+    try:
+        USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        USAGE_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+        _USAGE_CACHE = {"mtime": USAGE_FILE.stat().st_mtime, "data": dict(d)}
+    except OSError as exc:
+        logger.warning(f"[ltm] usage ledger write failed: {exc}")
+
+
 # 权限：优先用 access 统一判定，单拎时自动降级为本地名单（也能用）
 sys.path.insert(0, str(Path(__file__).parent.parent / "astrbot_plugin_access"))
 try:
@@ -468,6 +525,10 @@ class Main(star.Star):
         explicitly disabled.
         """
         base, key, model = _resolve_llm()
+        # 本地端点推理免费、通常也不返回 usage：额度闸与记账只针对第三方。
+        is_cloud = not any(h in base for h in ("127.0.0.1", "localhost", "10.0.", "192.168."))
+        if is_cloud and not _quota_ok():
+            raise RuntimeError("ltm 今日直连额度已满，跳过本轮抽取")
         limit = max_tokens or int(load_settings().get("max_tokens") or 300)
         payload: dict[str, Any] = {
             "model": model,
@@ -491,7 +552,10 @@ class Main(star.Star):
                     json=payload,
                 )
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"] or ""
+            payload_resp = resp.json()
+            if is_cloud:
+                _add_usage(int((payload_resp.get("usage") or {}).get("total_tokens") or 0))
+            return payload_resp["choices"][0]["message"]["content"] or ""
 
     # ---------- recall ----------
 
