@@ -57,6 +57,7 @@ def _detect_root() -> Path:
 DECLARED_COMMANDS: dict[str, tuple[str, str]] = {
     "/记忆 <内容>": ("记一条长期记忆", "公开"),
     "/记忆 去重": ("立即跑一次全库记忆去重（大模型判重）", "管理"),
+    "/记忆 清理": ("立即清理已过期记忆（按槽位保质期软删）", "管理"),
     "/忘记 <关键词>": ("删除匹配的长期记忆", "公开"),
 }
 
@@ -96,6 +97,15 @@ CMD_CONFIG = Path(
     )
 )
 
+# 「在打排位」「在赶稿」这类进行中的事很快过时，一直占着注入位还带误导。
+# 按 slot 设保质期（天），到期 superseded_by=-1 软删（与去重/FIFO 一致）。
+# 没列出的槽位永不过期；无 slot 的老条目（dashboard 手工插的）按 "_" 键算。
+DEFAULT_EXPIRE_DAYS: dict[str, int] = {
+    "activity": 3,      # 正在做的事，3 天就没参考价值了
+    "habit": 45,        # 长期习惯，一个半月没再提起就该淡出
+    "_": 180,           # 无槽位的旧条目，半年兜底清一次
+}
+
 DEFAULT_SETTINGS: dict[str, Any] = {
     "enabled": True,
     "scan_interval": 300,      # 多久醒一次攒群消息（秒）；醒来本身不调用模型
@@ -104,6 +114,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "extract_cooldown": 900,   # 私聊回复触发的最小间隔（秒）
     "max_tokens": 300,
     "third_party_scan": True,  # 第三方模式下是否也扫群历史（会产生 API 费用）
+    "expire_enabled": True,    # 自动清理已过期的记忆（软删）
+    "expire_days": DEFAULT_EXPIRE_DAYS,  # slot -> 保质期天数；缺失槽位永不过期
 }
 
 # 本地模式的兜底端点；正常情况由 cmd_config.json 的 provider 配置决定
@@ -1007,9 +1019,15 @@ class Main(star.Star):
             logger.info("[ltm] memory dedup loop started")
 
     async def _dedup_loop(self) -> None:
-        """Every 24h, let an LLM merge duplicate memories across all users."""
+        """Every 24h, expire stale memories and let an LLM merge duplicates."""
         await asyncio.sleep(DEDUP_FIRST_DELAY)
         while True:
+            try:
+                expired = await self._expire_once()
+                if expired:
+                    logger.info(f"[ltm] auto expire: {expired} stale memory(ies)")
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                logger.warning(f"[ltm] auto expire failed: {exc}")
             try:
                 stats = await self._dedup_once()
                 if stats["superseded"]:
@@ -1017,6 +1035,43 @@ class Main(star.Star):
             except Exception as exc:  # noqa: BLE001 - keep the loop alive
                 logger.warning(f"[ltm] auto dedup failed: {exc}")
             await asyncio.sleep(DEDUP_INTERVAL)
+
+    async def _expire_once(self) -> int:
+        """Soft-delete memories past their per-slot shelf life.
+
+        Returns:
+            Number of freshly expired rows.
+        """
+        conf = load_settings()
+        if not conf.get("expire_enabled", True):
+            return 0
+        ttl_raw = conf.get("expire_days") or DEFAULT_EXPIRE_DAYS
+        ttl: dict[str, float] = {}
+        for key, days in ttl_raw.items():
+            try:
+                ttl[str(key)] = max(0.0, float(days))
+            except (TypeError, ValueError):
+                continue
+        now = time.time()
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT id, slot, created FROM facts WHERE superseded_by IS NULL"
+            ).fetchall()
+            stale = [
+                fid
+                for fid, slot, created in rows
+                if ttl.get(str(slot) if slot else "_", 0) > 0
+                and now - created > ttl[str(slot) if slot else "_"] * 86400
+            ]
+            for fid in stale:
+                con.execute(
+                    "UPDATE facts SET superseded_by = -1 WHERE id = ?", (fid,)
+                )
+            con.commit()
+        finally:
+            con.close()
+        return len(stale)
 
     async def _dedup_once(self, limit: int = DEDUP_MAX_FACTS) -> dict:
         """Run one LLM-assisted dedup pass over live memories.
@@ -1243,6 +1298,16 @@ class Main(star.Star):
                 )
             else:
                 yield event.plain_result("去重完成：没发现重复的记忆。")
+            return
+        if arg == "清理":
+            if not _is_admin(event):
+                yield event.plain_result("这个指令只有管理员能用喵。")
+                return
+            expired = await self._expire_once()
+            if expired:
+                yield event.plain_result(f"清理完成：压掉 {expired} 条过期记忆。")
+            else:
+                yield event.plain_result("清理完成：没有过期的记忆。")
             return
         uid = event.get_sender_id() or event.get_session_id()
         con = self._conn()
